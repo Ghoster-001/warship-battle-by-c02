@@ -1942,7 +1942,7 @@
             return {
                 username: currentUser.username,
                 // Avatar trop lourd pour le réseau (ancien profil) : on n'envoie que l'initiale
-                avatar: currentUser.avatar && currentUser.avatar.length <= 600000 ? currentUser.avatar : null,
+                avatar: currentUser.avatar && currentUser.avatar.length <= (serverOnline ? 600000 : 60000) ? currentUser.avatar : null,
                 rank: `${rank.title} • Niv. ${rank.level}`
             };
         }
@@ -2034,10 +2034,13 @@
             document.getElementById('btn-guest-toggle-ready').classList.add('hidden');
 
             setupLocalBroadcastBridge(code);
-            // Mode en ligne : salon enregistré sur le serveur ; sinon connexion directe PeerJS
-            if (!relayHost(code)) peerInstance = createSafePeerInstance(`BN-HOST-${code}`, null, conn => {
-                acceptPeerConnection(conn);
-            });
+            // Salon relayé (serveur du jeu ou courtiers publics) ; connexion directe PeerJS en secours
+            const legacyHost = () => {
+                peerInstance = createSafePeerInstance(`BN-HOST-${code}`, null, conn => {
+                    acceptPeerConnection(conn);
+                });
+            };
+            if (!relayHost(code, legacyHost)) legacyHost();
             startPingMonitor();
         }
 
@@ -2074,13 +2077,16 @@
                 sendP2PMessage({ type: 'hello_guest', profile: getMyProfilePayload() });
             }, 250);
 
-            if (!relayJoin(code)) peerInstance = createSafePeerInstance(null, () => {
-                try {
-                    const conn = peerInstance.connect(`BN-HOST-${code}`, { reliable: true });
-                    activeConn = conn;
-                    bindPeerConnectionEvents(conn);
-                } catch (e) {}
-            });
+            const legacyJoin = () => {
+                peerInstance = createSafePeerInstance(null, () => {
+                    try {
+                        const conn = peerInstance.connect(`BN-HOST-${code}`, { reliable: true });
+                        activeConn = conn;
+                        bindPeerConnectionEvents(conn);
+                    } catch (e) {}
+                });
+            };
+            if (!relayJoin(code, legacyJoin)) legacyJoin();
             startPingMonitor();
         }
 
@@ -2106,8 +2112,8 @@
                 : 'Si aucun joueur n\'est trouvé sous 45s, une partie contre un Bot sera automatiquement lancée.';
 
             setupLocalBroadcastBridge(queueCode);
-            // Mode en ligne : file d'attente mondiale partagée ; sinon ancienne méthode (ID PeerJS fixe)
-            if (!startOnlineQueue(size)) peerInstance = createSafePeerInstance(null, () => {
+            // File d'attente mondiale relayée (serveur du jeu ou courtiers publics) ; ID PeerJS fixe en secours
+            const legacyQueue = () => { peerInstance = createSafePeerInstance(null, () => {
                 try {
                     const conn = peerInstance.connect(`BN-QUEUE-${size}`, { reliable: true });
                     conn.on('open', () => {
@@ -2123,7 +2129,8 @@
             }, null, () => {
                 // Mode local multi-onglets
                 sendP2PMessage({ type: 'random_seek', profile: getMyProfilePayload(), config: matchConfig });
-            });
+            }); };
+            if (!startOnlineQueue(size, legacyQueue)) legacyQueue();
 
             let remaining = 45;
             document.getElementById('lobby-search-timer').textContent = `${remaining}s`;
@@ -4248,12 +4255,298 @@
             }
         }
 
-        function relayOpen(onReady) {
-            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const ws = new WebSocket(`${proto}//${location.host}/ws`);
+        /* --- Relais sans serveur : courtiers MQTT publics (WebSocket sécurisé) ---
+           Utilisé quand le jeu n'est pas servi par server.js (par exemple sur GitHub Pages).
+           Les joueurs se retrouvent et échangent leurs messages de partie via des courtiers MQTT publics gratuits,
+           ce qui traverse les pare-feu mieux qu'une connexion directe. On se connecte à plusieurs courtiers à la fois
+           (dédoublonnage des messages) pour qu'une panne d'un seul ne bloque personne.
+           Données qui transitent : pseudo, miniature d'avatar, tirs. Jamais la position de la flotte (seulement une empreinte). */
+        const MQTT_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt', 'wss://test.mosquitto.org:8081/'];
+        const MQTT_ROOT = 'wbc02/v1';
+        const mqttEnc = new TextEncoder();
+        const mqttDec = new TextDecoder();
+
+        function concatBytes(...parts) {
+            let n = 0;
+            parts.forEach(p => { n += p.length; });
+            const out = new Uint8Array(n);
+            let off = 0;
+            parts.forEach(p => { out.set(p, off); off += p.length; });
+            return out;
+        }
+        function mqttStr(s) {
+            const b = mqttEnc.encode(s);
+            return concatBytes(Uint8Array.of(b.length >> 8, b.length & 255), b);
+        }
+        function mqttPacket(first, body) {
+            const len = [];
+            let n = body.length;
+            do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; len.push(d); } while (n > 0);
+            return concatBytes(Uint8Array.of(first, ...len), body);
+        }
+
+        function createMqttBus(onMessage, onReady, onFail) {
+            const bus = { id: randomHex(6), closed: false, ready: false, subs: new Set(), seen: new Map(), seq: 0, pid: 0, conns: [] };
+            let settled = 0;
+            let readyTimer = null;
+            const fireReady = () => { if (bus.ready || bus.closed) return; bus.ready = true; onReady(); };
+            const nextPid = () => { bus.pid = (bus.pid % 65535) + 1; return Uint8Array.of(bus.pid >> 8, bus.pid & 255); };
+            const sendOn = (c, bytes) => { try { if (c.up && c.ws.readyState === 1) c.ws.send(bytes); } catch (e) { /* connexion en cours de fermeture */ } };
+            const subscribeOn = (c, topic) => sendOn(c, mqttPacket(0x82, concatBytes(nextPid(), mqttStr(topic), Uint8Array.of(0))));
+
+            function deliver(topic, obj) {
+                if (typeof obj.mid !== 'string' || bus.seen.has(obj.mid)) return; // même message reçu via plusieurs courtiers
+                bus.seen.set(obj.mid, 1);
+                if (bus.seen.size > 800) bus.seen.delete(bus.seen.keys().next().value);
+                onMessage(topic, obj);
+            }
+
+            MQTT_BROKERS.forEach((url) => {
+                const c = { url, ws: null, up: false, ping: null, retries: 0, counted: false };
+                bus.conns.push(c);
+                const count = () => {
+                    if (c.counted) return;
+                    c.counted = true;
+                    settled++;
+                    if (settled >= MQTT_BROKERS.length) {
+                        if (bus.conns.some(x => x.up)) fireReady();
+                        else if (!bus.closed && !bus.ready) setTimeout(onFail, 0);
+                    }
+                };
+                const handle = (bytes, failTimer) => {
+                    let i = 0;
+                    while (i < bytes.length) {
+                        const first = bytes[i];
+                        let mult = 1, len = 0, j = i + 1, digit;
+                        do { digit = bytes[j++]; len += (digit & 127) * mult; mult *= 128; } while ((digit & 128) && j < bytes.length);
+                        if (j + len > bytes.length) break;
+                        const type = first >> 4;
+                        const body = bytes.subarray(j, j + len);
+                        if (type === 2) { // CONNACK
+                            if (body[1] === 0) {
+                                c.up = true;
+                                clearTimeout(failTimer);
+                                c.ping = setInterval(() => sendOn(c, Uint8Array.of(0xC0, 0)), 20000);
+                                bus.subs.forEach(t => subscribeOn(c, t));
+                                if (!bus.ready && !readyTimer) readyTimer = setTimeout(fireReady, 2500);
+                                count();
+                            } else { try { c.ws.close(); } catch (e) { /* déjà fermée */ } }
+                        } else if (type === 3) { // PUBLISH
+                            const qos = (first >> 1) & 3;
+                            const tl = (body[0] << 8) | body[1];
+                            const topic = mqttDec.decode(body.subarray(2, 2 + tl));
+                            let obj = null;
+                            try { obj = JSON.parse(mqttDec.decode(body.subarray(2 + tl + (qos > 0 ? 2 : 0)))); } catch (e) { obj = null; }
+                            if (obj && typeof obj === 'object') deliver(topic, obj);
+                        }
+                        i = j + len;
+                    }
+                };
+                const connect = () => {
+                    if (bus.closed) return;
+                    let ws;
+                    try { ws = new WebSocket(url, 'mqtt'); } catch (e) { count(); return; }
+                    c.ws = ws;
+                    ws.binaryType = 'arraybuffer';
+                    const failTimer = setTimeout(() => { if (!c.up) { try { ws.close(); } catch (e) { /* déjà fermée */ } count(); } }, 7000);
+                    ws.onopen = () => ws.send(mqttPacket(0x10, concatBytes(mqttStr('MQTT'), Uint8Array.of(4, 2, 0, 45), mqttStr(`wbc02-${bus.id}-${Math.random().toString(36).slice(2, 6)}`))));
+                    ws.onmessage = (e) => handle(new Uint8Array(e.data), failTimer);
+                    ws.onerror = () => {};
+                    ws.onclose = () => {
+                        clearTimeout(failTimer);
+                        clearInterval(c.ping);
+                        const wasUp = c.up;
+                        c.up = false;
+                        count();
+                        if (wasUp && !bus.closed && c.retries++ < 5) setTimeout(connect, 2000);
+                    };
+                };
+                connect();
+            });
+
+            bus.subscribe = (topic) => { bus.subs.add(topic); bus.conns.forEach(c => subscribeOn(c, topic)); };
+            bus.unsubscribe = (topic) => {
+                bus.subs.delete(topic);
+                bus.conns.forEach(c => sendOn(c, mqttPacket(0xA2, concatBytes(nextPid(), mqttStr(topic)))));
+            };
+            bus.publish = (topic, obj) => {
+                obj.mid = `${bus.id}:${++bus.seq}`;
+                const packet = mqttPacket(0x30, concatBytes(mqttStr(topic), mqttEnc.encode(JSON.stringify(obj))));
+                bus.conns.forEach(c => sendOn(c, packet));
+            };
+            bus.close = () => {
+                bus.closed = true;
+                clearTimeout(readyTimer);
+                bus.conns.forEach(c => { clearInterval(c.ping); try { c.ws && c.ws.close(); } catch (e) { /* déjà fermée */ } });
+            };
+            return bus;
+        }
+
+        // Imite le serveur de relais (mêmes messages : queue / host / join / relay / leave  ->  paired / relay / peer_left / error)
+        function createMqttWs() {
+            const ws = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null };
+            let bus = null;
+            let mode = null; // null | 'queue' | 'host' | 'joining' | 'paired'
+            let chan = null;
+            let pending = null;
+            let queueTopic = null;
+            let roomTopic = null;
+            let seekTimer = null;
+            let joinTimer = null;
+            let offerTimer = null;
+            const CH = `${MQTT_ROOT}/ch/`;
+            const CHAN_RE = /^[0-9a-f]{24}$/;
+            const emit = (obj) => { if (ws.onmessage) ws.onmessage({ data: JSON.stringify(obj) }); };
+            const inbox = (id) => `${MQTT_ROOT}/u/${id}`;
+
+            function stopTimers() {
+                clearInterval(seekTimer); clearInterval(joinTimer); clearTimeout(offerTimer);
+                seekTimer = joinTimer = offerTimer = null;
+            }
+            function leave(sendBye) {
+                stopTimers();
+                if (chan && sendBye) bus.publish(CH + chan, { k: 'bye', from: bus.id });
+                if (chan) bus.unsubscribe(CH + chan);
+                if (pending) { bus.unsubscribe(CH + pending.ch); pending = null; }
+                if (queueTopic) { bus.unsubscribe(queueTopic); queueTopic = null; }
+                if (roomTopic) { bus.unsubscribe(roomTopic); roomTopic = null; }
+                chan = null;
+                mode = null;
+            }
+
+            function onBusMessage(topic, m) {
+                if (m.from === bus.id) return;
+                if (queueTopic && topic === queueTopic && m.k === 'seek') {
+                    // Le joueur dont l'identifiant est le plus grand initie : jamais deux offres croisées
+                    if (mode === 'queue' && !pending && typeof m.from === 'string' && bus.id > m.from) {
+                        const ch = randomHex(12);
+                        pending = { ch, to: m.from };
+                        bus.subscribe(CH + ch);
+                        bus.publish(inbox(m.from), { k: 'offer', from: bus.id, ch });
+                        offerTimer = setTimeout(() => {
+                            if (pending && pending.ch === ch) { bus.unsubscribe(CH + ch); pending = null; }
+                        }, 6000);
+                    }
+                } else if (topic === inbox(bus.id)) {
+                    if (m.k === 'offer' && mode === 'queue' && typeof m.ch === 'string' && CHAN_RE.test(m.ch)) {
+                        // On m'a trouvé : je suis l'hôte (le plus ancien chercheur)
+                        stopTimers();
+                        if (queueTopic) { bus.unsubscribe(queueTopic); queueTopic = null; }
+                        if (pending) { bus.unsubscribe(CH + pending.ch); pending = null; }
+                        chan = m.ch;
+                        mode = 'paired';
+                        bus.subscribe(CH + chan);
+                        bus.publish(CH + chan, { k: 'accept', from: bus.id });
+                        emit({ t: 'paired', role: 'host' });
+                    } else if (m.k === 'accept' && mode === 'joining' && typeof m.ch === 'string' && CHAN_RE.test(m.ch)) {
+                        stopTimers();
+                        chan = m.ch;
+                        mode = 'paired';
+                        bus.subscribe(CH + chan);
+                        emit({ t: 'paired', role: 'guest' });
+                    }
+                } else if (roomTopic && topic === roomTopic && m.k === 'join') {
+                    if (mode === 'host' && typeof m.from === 'string') {
+                        const ch = randomHex(12);
+                        chan = ch;
+                        mode = 'paired';
+                        bus.subscribe(CH + ch);
+                        bus.unsubscribe(roomTopic);
+                        roomTopic = null;
+                        bus.publish(inbox(m.from), { k: 'accept', ch });
+                        emit({ t: 'paired', role: 'host' });
+                    }
+                } else if (topic.startsWith(CH)) {
+                    const id = topic.slice(CH.length);
+                    if (m.k === 'accept' && mode === 'queue' && pending && pending.ch === id && m.from === pending.to) {
+                        stopTimers();
+                        chan = id;
+                        pending = null;
+                        mode = 'paired';
+                        if (queueTopic) { bus.unsubscribe(queueTopic); queueTopic = null; }
+                        emit({ t: 'paired', role: 'guest' });
+                    } else if (mode === 'paired' && chan === id) {
+                        if (m.k === 'relay') emit({ t: 'relay', data: m.data });
+                        else if (m.k === 'bye') {
+                            bus.unsubscribe(CH + chan);
+                            chan = null;
+                            mode = null;
+                            emit({ t: 'peer_left' });
+                        }
+                    }
+                }
+            }
+
+            ws.send = (str) => {
+                let m;
+                try { m = JSON.parse(str); } catch (e) { return; }
+                if (!bus || ws.readyState !== 1 || !m || typeof m.t !== 'string') return;
+                if (m.t === 'queue' && Number.isInteger(m.size) && m.size >= 6 && m.size <= 15) {
+                    leave(true);
+                    mode = 'queue';
+                    queueTopic = `${MQTT_ROOT}/q/${m.size}`;
+                    bus.subscribe(queueTopic);
+                    const seek = () => bus.publish(queueTopic, { k: 'seek', from: bus.id });
+                    seek();
+                    seekTimer = setInterval(seek, 1500);
+                } else if (m.t === 'host' && typeof m.code === 'string' && /^[A-Z0-9]{6}$/.test(m.code)) {
+                    leave(true);
+                    mode = 'host';
+                    roomTopic = `${MQTT_ROOT}/room/${m.code}`;
+                    bus.subscribe(roomTopic);
+                    emit({ t: 'hosting', code: m.code });
+                } else if (m.t === 'join' && typeof m.code === 'string' && /^[A-Z0-9]{6}$/.test(m.code)) {
+                    leave(true);
+                    mode = 'joining';
+                    const topic = `${MQTT_ROOT}/room/${m.code}`;
+                    const ask = () => bus.publish(topic, { k: 'join', from: bus.id });
+                    ask();
+                    let tries = 0;
+                    joinTimer = setInterval(() => {
+                        if (mode !== 'joining') return;
+                        if (++tries >= 4) { stopTimers(); mode = null; emit({ t: 'error', code: 'no_room' }); return; }
+                        ask();
+                    }, 2000);
+                } else if (m.t === 'relay') {
+                    if (mode === 'paired' && chan) bus.publish(CH + chan, { k: 'relay', from: bus.id, data: m.data });
+                } else if (m.t === 'leave') {
+                    leave(true);
+                }
+            };
+            ws.close = () => {
+                if (ws.readyState === 3) return;
+                ws.readyState = 3;
+                if (bus) { try { leave(true); } catch (e) { /* déjà fermé */ } bus.close(); }
+            };
+
+            bus = createMqttBus(onBusMessage, () => {
+                ws.readyState = 1;
+                bus.subscribe(inbox(bus.id));
+                if (ws.onopen) ws.onopen();
+            }, () => {
+                ws.readyState = 3;
+                if (ws.onclose) ws.onclose();
+            });
+            return ws;
+        }
+
+        function relayOpen(onReady, onFail) {
+            let ws;
+            try {
+                if (serverOnline) {
+                    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    ws = new WebSocket(`${proto}//${location.host}/ws`);
+                } else {
+                    ws = createMqttWs();
+                }
+            } catch (e) {
+                if (onFail) onFail();
+                return null;
+            }
             const r = { ws, conn: null, hostCode: null };
             relay = r;
-            ws.onopen = () => { if (relay === r) onReady(r); };
+            let opened = false;
+            ws.onopen = () => { opened = true; if (relay === r) onReady(r); };
             ws.onmessage = (ev) => {
                 let m;
                 try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -4262,6 +4555,7 @@
             ws.onclose = () => {
                 if (relay !== r) return;
                 relay = null;
+                if (!opened) { if (onFail) onFail(); return; } // relais injoignable : connexion directe PeerJS en secours
                 if (r.conn && r.conn.open) { r.conn.open = false; r.conn.emit('close'); }
             };
             ws.onerror = () => {};
@@ -4279,24 +4573,26 @@
             if (relay && !relay.conn) closeRelay();
         }
 
-        function startOnlineQueue(size) {
-            if (!serverOnline) return false;
-            relayOpen((r) => r.ws.send(JSON.stringify({ t: 'queue', size })));
+        function relayAvailable() { return typeof WebSocket !== 'undefined'; }
+
+        function startOnlineQueue(size, legacy) {
+            if (!relayAvailable()) return false;
+            relayOpen((r) => r.ws.send(JSON.stringify({ t: 'queue', size })), legacy);
             return true;
         }
 
-        function relayHost(code) {
-            if (!serverOnline) return false;
+        function relayHost(code, legacy) {
+            if (!relayAvailable()) return false;
             relayOpen((r) => {
                 r.hostCode = code;
                 r.ws.send(JSON.stringify({ t: 'host', code }));
-            });
+            }, legacy);
             return true;
         }
 
-        function relayJoin(code) {
-            if (!serverOnline) return false;
-            relayOpen((r) => r.ws.send(JSON.stringify({ t: 'join', code })));
+        function relayJoin(code, legacy) {
+            if (!relayAvailable()) return false;
+            relayOpen((r) => r.ws.send(JSON.stringify({ t: 'join', code })), legacy);
             return true;
         }
 
@@ -4314,7 +4610,7 @@
                 if (txt) txt.textContent = 'Mode local prêt (IA & Salons multi-onglets)';
             } else {
                 if (dot) dot.className = 'w-2 h-2 rounded-full bg-amber-400';
-                if (txt) txt.textContent = 'Mode direct : parties entre joueurs, sans serveur';
+                if (txt) txt.textContent = 'Mode sans serveur : parties via relais public gratuit';
             }
         };
     </script>

@@ -25,8 +25,9 @@ Bataille navale multijoueur dans le navigateur : **aucun téléchargement, aucun
 2. L'un clique sur **Hôte** et partage le code à 6 caractères.
 3. L'autre clique sur **Rejoindre une partie** et saisit le code.
 
-Les deux navigateurs se connectent directement. Certains réseaux (4G/5G, entreprises) peuvent bloquer cette
-connexion directe ; réessayez alors depuis un autre réseau.
+Les parties passent par des **relais publics gratuits** (courtiers MQTT sur connexion sécurisée), ce qui fonctionne
+depuis presque n'importe quel réseau (Wi-Fi, 4G/5G). Y transitent le pseudo, une miniature d'avatar et les tirs, jamais la
+position des navires. Si ces relais sont bloqués par un réseau très restrictif, le jeu essaie une connexion directe en secours.
 
 ## Pour les curieux
 
